@@ -63,6 +63,9 @@ trait Renderer {
 
 static TRAMPOLINE: OnceLock<(DXGISwapChainPresentType, DXGISwapChainResizeBuffersType)> =
     OnceLock::new();
+static WND_PROC: OnceLock<WndProcType> = OnceLock::new();
+static WND_PROC_MESSAGE_TX: OnceLock<std::sync::mpsc::Sender<WindowProcedureMessage>> =
+    OnceLock::new();
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Hook entry points
@@ -118,23 +121,14 @@ unsafe extern "system" fn imgui_wnd_proc(
     WPARAM(wparam): WPARAM,
     LPARAM(lparam): LPARAM,
 ) -> LRESULT {
-    match IMGUI_RENDERER.get().map(Mutex::try_lock) {
-        Some(Some(imgui_renderer)) => imgui_wnd_proc_impl(
-            hwnd,
-            umsg,
-            WPARAM(wparam),
-            LPARAM(lparam),
-            imgui_renderer,
-            IMGUI_RENDER_LOOP.get().unwrap(),
-        ),
-        Some(None) => {
-            debug!("Could not lock in WndProc");
-            DefWindowProcW(hwnd, umsg, WPARAM(wparam), LPARAM(lparam))
+    if let Some(wnd_proc_message_tx) = WND_PROC_MESSAGE_TX.get() {
+        let _ = wnd_proc_message_tx.send(WindowProcedureMessage { hwnd, umsg, wparam, lparam });
+    }
+    match WND_PROC.get() {
+        Some(wnd_proc) => {
+            CallWindowProcW(Some(*wnd_proc), hwnd, umsg, WPARAM(wparam), LPARAM(lparam))
         },
-        None => {
-            debug!("WndProc called before hook was set");
-            DefWindowProcW(hwnd, umsg, WPARAM(wparam), LPARAM(lparam))
-        },
+        None => DefWindowProcW(hwnd, umsg, WPARAM(wparam), LPARAM(lparam)),
     }
 }
 
@@ -173,6 +167,7 @@ impl ImguiRenderer {
             GWLP_WNDPROC,
             imgui_wnd_proc as usize as isize,
         ));
+        WND_PROC.set(wnd_proc).unwrap();
 
         #[cfg(target_arch = "x86")]
         let wnd_proc = std::mem::transmute::<_, WndProcType>(SetWindowLongA(
@@ -185,6 +180,10 @@ impl ImguiRenderer {
         let mut renderer = ImguiRenderer { ctx, engine, wnd_proc, swap_chain };
 
         ImguiWindowsEventHandler::setup_io(&mut renderer);
+
+        let (wnd_proc_message_tx, wnd_proc_message_rx) = std::sync::mpsc::channel();
+        WND_PROC_MESSAGE_TX.set(wnd_proc_message_tx).unwrap();
+        std::thread::spawn(move || message_loop(wnd_proc_message_rx));
 
         renderer
     }
@@ -271,6 +270,35 @@ impl ImguiWindowsEventHandler for ImguiRenderer {
 
 unsafe impl Send for ImguiRenderer {}
 unsafe impl Sync for ImguiRenderer {}
+
+struct WindowProcedureMessage {
+    hwnd: HWND,
+    umsg: u32,
+    wparam: usize,
+    lparam: isize,
+}
+
+unsafe fn message_loop(wnd_prc_message_rx: std::sync::mpsc::Receiver<WindowProcedureMessage>) {
+    loop {
+        let WindowProcedureMessage { hwnd, umsg, wparam, lparam } =
+            wnd_prc_message_rx.recv().unwrap();
+
+        let Some(imgui_renderer) = IMGUI_RENDERER.get() else {
+            continue;
+        };
+
+        let imgui_renderer = imgui_renderer.lock();
+
+        let _ = imgui_wnd_proc_impl(
+            hwnd,
+            umsg,
+            WPARAM(wparam),
+            LPARAM(lparam),
+            imgui_renderer,
+            IMGUI_RENDER_LOOP.get().unwrap(),
+        );
+    }
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Function address finders

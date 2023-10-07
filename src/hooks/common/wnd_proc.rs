@@ -302,5 +302,6 @@ where
         return LRESULT(1);
     }
 
-    unsafe { CallWindowProcW(Some(wnd_proc), hwnd, umsg, WPARAM(wparam), LPARAM(lparam)) }
+    // unsafe { CallWindowProcW(Some(wnd_proc), hwnd, umsg, WPARAM(wparam), LPARAM(lparam)) }
+    return LRESULT(0);
 }
