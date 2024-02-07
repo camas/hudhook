@@ -118,7 +118,7 @@ use once_cell::sync::OnceCell;
 use renderer::RenderEngine;
 use tracing::error;
 use windows::core::Error;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::HINSTANCE;
 use windows::Win32::System::Console::{
     AllocConsole, FreeConsole, GetConsoleMode, GetStdHandle, SetConsoleMode, CONSOLE_MODE,
     ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_OUTPUT_HANDLE,
@@ -221,9 +221,6 @@ pub trait ImguiRenderLoop {
     /// Called before rendering each frame. Use the provided `ctx` object to
     /// modify imgui settings before rendering the UI.
     fn before_render(&mut self, _render_engine: &mut RenderEngine) {}
-
-    /// Called during the window procedure.
-    fn on_wnd_proc(&self, _hwnd: HWND, _umsg: u32, _wparam: WPARAM, _lparam: LPARAM) {}
 
     /// If this function returns `true`, the WndProc function will not call the
     /// procedure of the parent window.
@@ -418,6 +415,9 @@ macro_rules! hudhook {
         ) {
             if reason == ::hudhook::windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH {
                 ::hudhook::tracing::trace!("DllMain()");
+                _ = ::hudhook::windows::Win32::System::LibraryLoader::DisableThreadLibraryCalls(
+                    hmodule,
+                );
                 ::std::thread::spawn(move || {
                     if let Err(e) = ::hudhook::Hudhook::builder()
                         .with::<$t>({ $hooks })

@@ -1,6 +1,6 @@
 use std::mem;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::{mpsc, OnceLock};
 
 use parking_lot::Mutex;
 use tracing::{debug, error, trace};
@@ -11,7 +11,7 @@ use windows::Win32::UI::WindowsAndMessaging::SetWindowLongA;
 use windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrA;
 use windows::Win32::UI::WindowsAndMessaging::{DefWindowProcW, GWLP_WNDPROC};
 
-use crate::renderer::input::{imgui_wnd_proc_impl, WndProcType};
+use crate::renderer::input::{imgui_wnd_proc_impl, update_io, InputChange, WndProcType};
 use crate::renderer::RenderEngine;
 use crate::ImguiRenderLoop;
 
@@ -20,6 +20,9 @@ static mut WND_PROC: OnceLock<WndProcType> = OnceLock::new();
 static mut RENDER_ENGINE: OnceLock<Mutex<RenderEngine>> = OnceLock::new();
 static mut RENDER_LOOP: OnceLock<Box<dyn ImguiRenderLoop + Send + Sync>> = OnceLock::new();
 static RENDER_LOCK: AtomicBool = AtomicBool::new(false);
+static mut WND_PROC_TX: OnceLock<mpsc::Sender<InputChange>> = OnceLock::new();
+static mut WND_PROC_RX: OnceLock<mpsc::Receiver<InputChange>> = OnceLock::new();
+static mut SHOULD_BLOCK_MESSAGES: AtomicBool = AtomicBool::new(false);
 
 /// Global renderer state manager.
 ///
@@ -44,6 +47,12 @@ impl RenderState {
     /// ```
     pub fn setup<F: Fn() -> HWND>(f: F) -> HWND {
         let hwnd = unsafe { *GAME_HWND.get_or_init(f) };
+
+        let (wnd_proc_tx, wnd_proc_rx) = mpsc::channel();
+        unsafe {
+            WND_PROC_TX.get_or_init(|| wnd_proc_tx);
+            WND_PROC_RX.get_or_init(|| wnd_proc_rx);
+        }
 
         unsafe {
             WND_PROC.get_or_init(|| {
@@ -113,10 +122,28 @@ impl RenderState {
             return;
         };
 
+        {
+            let ctx = render_engine.ctx();
+            let mut ctx = ctx.borrow_mut();
+            let io = ctx.io_mut();
+            let wnd_proc_rx = unsafe { WND_PROC_RX.get_mut().unwrap() };
+            wnd_proc_rx.try_iter().for_each(|input_change| update_io(io, input_change));
+        }
+
         render_loop.before_render(&mut render_engine);
 
         if let Err(e) = render_engine.render(|ui| render_loop.render(ui)) {
             error!("Render: {e:?}");
+        }
+
+        let should_block_messages = {
+            let ctx = render_engine.ctx();
+            let ctx = ctx.borrow();
+            let io = ctx.io();
+            render_loop.should_block_messages(io)
+        };
+        unsafe {
+            SHOULD_BLOCK_MESSAGES.store(should_block_messages, Ordering::Relaxed);
         }
 
         RENDER_LOCK.store(false, Ordering::SeqCst);
@@ -125,12 +152,15 @@ impl RenderState {
     /// Resize the engine. Generally only needs to be called automatically as a
     /// consequence of the `WM_SIZE` event.
     pub fn resize() {
-        // TODO sometimes it doesn't lock.
-        if let Some(Some(mut render_engine)) = unsafe { RENDER_ENGINE.get().map(Mutex::try_lock) } {
-            trace!("Resizing");
-            if let Err(e) = render_engine.resize() {
-                error!("Couldn't resize: {e:?}");
-            }
+        let render_engine_mutex = match unsafe { RENDER_ENGINE.get() } {
+            Some(v) => v,
+            None => return,
+        };
+        let mut render_engine = render_engine_mutex.lock();
+
+        trace!("Resizing");
+        if let Err(e) = render_engine.resize() {
+            error!("Couldn't resize: {e:?}");
         }
     }
 
@@ -159,27 +189,22 @@ unsafe extern "system" fn imgui_wnd_proc(
     WPARAM(wparam): WPARAM,
     LPARAM(lparam): LPARAM,
 ) -> LRESULT {
-    let render_engine = match RENDER_ENGINE.get().map(Mutex::try_lock) {
-        Some(Some(render_engine)) => render_engine,
-        Some(None) => {
-            debug!("Could not lock in WndProc");
-            return DefWindowProcW(hwnd, umsg, WPARAM(wparam), LPARAM(lparam));
-        },
-        None => {
-            debug!("WndProc called before hook was set");
-            return DefWindowProcW(hwnd, umsg, WPARAM(wparam), LPARAM(lparam));
-        },
-    };
-
-    let Some(render_loop) = RENDER_LOOP.get() else {
-        debug!("Could not get render loop");
+    if RENDER_ENGINE.get().is_none() {
+        debug!("WndProc called before hook was set");
         return DefWindowProcW(hwnd, umsg, WPARAM(wparam), LPARAM(lparam));
-    };
+    }
 
     let Some(&wnd_proc) = WND_PROC.get() else {
         debug!("Could not get original WndProc");
         return DefWindowProcW(hwnd, umsg, WPARAM(wparam), LPARAM(lparam));
     };
+
+    let Some(wnd_proc_tx) = WND_PROC_TX.get() else {
+        error!("WndProc called before WND_PROC_TX set");
+        return DefWindowProcW(hwnd, umsg, WPARAM(wparam), LPARAM(lparam));
+    };
+
+    let should_block_messages = SHOULD_BLOCK_MESSAGES.load(Ordering::Relaxed);
 
     imgui_wnd_proc_impl(
         hwnd,
@@ -187,7 +212,7 @@ unsafe extern "system" fn imgui_wnd_proc(
         WPARAM(wparam),
         LPARAM(lparam),
         wnd_proc,
-        render_engine,
-        render_loop,
+        wnd_proc_tx,
+        should_block_messages,
     )
 }

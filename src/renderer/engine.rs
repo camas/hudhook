@@ -526,7 +526,7 @@ impl RenderEngine {
         // Draw data loop.
         let ctx = Rc::clone(&self.ctx);
         let mut ctx = ctx.borrow_mut();
-        let ui = ctx.frame();
+        let ui = ctx.new_frame();
         render_loop(ui);
         let draw_data = ctx.render();
 
@@ -1136,12 +1136,12 @@ impl RenderEngine {
                 display_pos[1] + display_size[1],
             ];
 
-            [[2. / (r - l), 0., 0., 0.], [0., 2. / (t - b), 0., 0.], [0., 0., 0.5, 0.], [
-                (r + l) / (l - r),
-                (t + b) / (b - t),
-                0.5,
-                1.0,
-            ]]
+            [
+                [2. / (r - l), 0., 0., 0.],
+                [0., 2. / (t - b), 0., 0.],
+                [0., 0., 0.5, 0.],
+                [(r + l) / (l - r), (t + b) / (b - t), 0.5, 1.0],
+            ]
         };
 
         trace!("Display size {}x{}", display_size[0], display_size[1]);

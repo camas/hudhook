@@ -2,9 +2,9 @@
 
 use std::ffi::c_void;
 use std::mem::size_of;
+use std::sync::mpsc;
 
 use imgui::Io;
-use parking_lot::MutexGuard;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Input::{
@@ -13,8 +13,7 @@ use windows::Win32::UI::Input::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::renderer::{RenderEngine, RenderState};
-use crate::ImguiRenderLoop;
+use crate::renderer::RenderState;
 
 pub type WndProcType =
     unsafe extern "system" fn(hwnd: HWND, umsg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT;
@@ -23,6 +22,18 @@ pub type WndProcType =
 #[inline]
 fn hiword(l: u32) -> u16 {
     ((l >> 16) & 0xffff) as u16
+}
+
+pub(crate) enum InputChange {
+    MouseDown { index: usize, value: bool },
+    KeyDown { index: usize, value: bool },
+    MouseWheelScroll { delta: f32 },
+    MouseWheelHorizontalScroll { delta: f32 },
+    AddInputCharacter { character: char },
+    CtrlPressed { value: bool },
+    ShiftPressed { value: bool },
+    AltPressed { value: bool },
+    SuperPressed { value: bool },
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -34,69 +45,71 @@ fn hiword(l: u32) -> u16 {
 // Given the RAWINPUT structure, check each possible mouse flag status and
 // update the Io object accordingly. Both the key_down indices associated to the
 // mouse click (VK_...) and the values in mouse_down are updated.
-fn handle_raw_mouse_input(io: &mut Io, raw_mouse: &RAWMOUSE_0_0) {
+fn handle_raw_mouse_input(wnd_proc_tx: &mpsc::Sender<InputChange>, raw_mouse: &RAWMOUSE_0_0) {
     let button_flags = raw_mouse.usButtonFlags as u32;
 
     let has_flag = |flag| button_flags & flag != 0;
-    let mut set_key_down = |VIRTUAL_KEY(index), val: bool| io.keys_down[index as usize] = val;
+    let set_key_down = |VIRTUAL_KEY(index), val| {
+        _ = wnd_proc_tx.send(InputChange::KeyDown { index: index as usize, value: val });
+    };
 
     // Check whether any of the mouse buttons was pressed or released.
     if has_flag(RI_MOUSE_LEFT_BUTTON_DOWN) {
         set_key_down(VK_LBUTTON, true);
-        io.mouse_down[0] = true;
+        _ = wnd_proc_tx.send(InputChange::MouseDown { index: 0, value: true });
     }
     if has_flag(RI_MOUSE_LEFT_BUTTON_UP) {
         set_key_down(VK_LBUTTON, false);
-        io.mouse_down[0] = false;
+        _ = wnd_proc_tx.send(InputChange::MouseDown { index: 0, value: false });
     }
     if has_flag(RI_MOUSE_RIGHT_BUTTON_DOWN) {
         set_key_down(VK_RBUTTON, true);
-        io.mouse_down[1] = true;
+        _ = wnd_proc_tx.send(InputChange::MouseDown { index: 1, value: true });
     }
     if has_flag(RI_MOUSE_RIGHT_BUTTON_UP) {
         set_key_down(VK_RBUTTON, false);
-        io.mouse_down[1] = false;
+        _ = wnd_proc_tx.send(InputChange::MouseDown { index: 1, value: false });
     }
     if has_flag(RI_MOUSE_MIDDLE_BUTTON_DOWN) {
         set_key_down(VK_MBUTTON, true);
-        io.mouse_down[2] = true;
+        _ = wnd_proc_tx.send(InputChange::MouseDown { index: 2, value: true });
     }
     if has_flag(RI_MOUSE_MIDDLE_BUTTON_UP) {
         set_key_down(VK_MBUTTON, false);
-        io.mouse_down[2] = false;
+        _ = wnd_proc_tx.send(InputChange::MouseDown { index: 2, value: false });
     }
     if has_flag(RI_MOUSE_BUTTON_4_DOWN) {
         set_key_down(VK_XBUTTON1, true);
-        io.mouse_down[3] = true;
+        _ = wnd_proc_tx.send(InputChange::MouseDown { index: 3, value: true });
     }
     if has_flag(RI_MOUSE_BUTTON_4_UP) {
         set_key_down(VK_XBUTTON1, false);
-        io.mouse_down[3] = false;
+        _ = wnd_proc_tx.send(InputChange::MouseDown { index: 3, value: false });
     }
     if has_flag(RI_MOUSE_BUTTON_5_DOWN) {
         set_key_down(VK_XBUTTON2, true);
-        io.mouse_down[4] = true;
+        _ = wnd_proc_tx.send(InputChange::MouseDown { index: 4, value: true });
     }
     if has_flag(RI_MOUSE_BUTTON_5_UP) {
         set_key_down(VK_XBUTTON2, false);
-        io.mouse_down[4] = false;
+        _ = wnd_proc_tx.send(InputChange::MouseDown { index: 4, value: false });
     }
 
     // Apply vertical mouse scroll.
     if button_flags & RI_MOUSE_WHEEL != 0 {
         let wheel_delta = raw_mouse.usButtonData as i16 / WHEEL_DELTA as i16;
-        io.mouse_wheel += wheel_delta as f32;
+        _ = wnd_proc_tx.send(InputChange::MouseWheelScroll { delta: wheel_delta as f32 });
     }
 
     // Apply horizontal mouse scroll.
     if button_flags & RI_MOUSE_HWHEEL != 0 {
         let wheel_delta = raw_mouse.usButtonData as i16 / WHEEL_DELTA as i16;
-        io.mouse_wheel_h += wheel_delta as f32;
+        _ = wnd_proc_tx.send(InputChange::MouseWheelHorizontalScroll { delta: wheel_delta as f32 });
     }
 }
 
 // Handle raw keyboard input.
-fn handle_raw_keyboard_input(io: &mut Io, raw_keyboard: &RAWKEYBOARD) {
+fn handle_raw_keyboard_input(wnd_proc_tx: &mpsc::Sender<InputChange>, raw_keyboard: &RAWKEYBOARD) {
     // Ignore messages without a valid key code
     if raw_keyboard.VKey == 0 {
         return;
@@ -137,16 +150,20 @@ fn handle_raw_keyboard_input(io: &mut Io, raw_keyboard: &RAWKEYBOARD) {
     // of key_down for that virtual key.
     if virtual_key < 0xFF {
         if is_key_down {
-            io.keys_down[virtual_key] = true;
+            _ = wnd_proc_tx.send(InputChange::KeyDown { index: virtual_key, value: true });
         }
         if is_key_up {
-            io.keys_down[virtual_key] = false;
+            _ = wnd_proc_tx.send(InputChange::KeyDown { index: virtual_key, value: false });
         }
     }
 }
 
 // Handle WM_INPUT events.
-fn handle_raw_input(io: &mut Io, WPARAM(wparam): WPARAM, LPARAM(lparam): LPARAM) {
+fn handle_raw_input(
+    wnd_proc_tx: &mpsc::Sender<InputChange>,
+    WPARAM(wparam): WPARAM,
+    LPARAM(lparam): LPARAM,
+) {
     let mut raw_data = RAWINPUT { ..Default::default() };
     let mut raw_data_size = size_of::<RAWINPUT>() as u32;
     let raw_data_header_size = size_of::<RAWINPUTHEADER>() as u32;
@@ -175,10 +192,12 @@ fn handle_raw_input(io: &mut Io, WPARAM(wparam): WPARAM, LPARAM(lparam): LPARAM)
     // Dispatch to the appropriate raw input processing method.
     match RID_DEVICE_INFO_TYPE(raw_data.header.dwType) {
         RIM_TYPEMOUSE => {
-            handle_raw_mouse_input(io, unsafe { &raw_data.data.mouse.Anonymous.Anonymous });
+            handle_raw_mouse_input(wnd_proc_tx, unsafe {
+                &raw_data.data.mouse.Anonymous.Anonymous
+            });
         },
         RIM_TYPEKEYBOARD => {
-            handle_raw_keyboard_input(io, unsafe { &raw_data.data.keyboard });
+            handle_raw_keyboard_input(wnd_proc_tx, unsafe { &raw_data.data.keyboard });
         },
         _ => {},
     }
@@ -215,22 +234,47 @@ fn map_vkey(wparam: u16, lparam: usize) -> VIRTUAL_KEY {
 }
 
 // Handle WM_(SYS)KEYDOWN/WM_(SYS)KEYUP events.
-fn handle_input(io: &mut Io, state: u32, WPARAM(wparam): WPARAM, LPARAM(lparam): LPARAM) {
+fn handle_input(
+    wnd_proc_tx: &mpsc::Sender<InputChange>,
+    state: u32,
+    WPARAM(wparam): WPARAM,
+    LPARAM(lparam): LPARAM,
+) {
     let pressed = (state == WM_KEYDOWN) || (state == WM_SYSKEYDOWN);
     let key_pressed = map_vkey(wparam as _, lparam as _);
-    io.keys_down[key_pressed.0 as usize] = pressed;
+    _ = wnd_proc_tx.send(InputChange::KeyDown { index: key_pressed.0 as usize, value: pressed });
 
     // According to the winit implementation [1], it's ok to check twice, and the
     // logic isn't flawed either.
     //
     // [1] https://github.com/imgui-rs/imgui-rs/blob/b1e66d050e84dbb2120001d16ce59d15ef6b5303/imgui-winit-support/src/lib.rs#L401-L404
     match key_pressed {
-        VK_CONTROL | VK_LCONTROL | VK_RCONTROL => io.key_ctrl = pressed,
-        VK_SHIFT | VK_LSHIFT | VK_RSHIFT => io.key_shift = pressed,
-        VK_MENU | VK_LMENU | VK_RMENU => io.key_alt = pressed,
-        VK_LWIN | VK_RWIN => io.key_super = pressed,
+        VK_CONTROL | VK_LCONTROL | VK_RCONTROL => {
+            _ = wnd_proc_tx.send(InputChange::CtrlPressed { value: pressed })
+        },
+        VK_SHIFT | VK_LSHIFT | VK_RSHIFT => {
+            _ = wnd_proc_tx.send(InputChange::ShiftPressed { value: pressed })
+        },
+        VK_MENU | VK_LMENU | VK_RMENU => {
+            _ = wnd_proc_tx.send(InputChange::AltPressed { value: pressed })
+        },
+        VK_LWIN | VK_RWIN => _ = wnd_proc_tx.send(InputChange::SuperPressed { value: pressed }),
         _ => (),
     };
+}
+
+pub(crate) fn update_io(io: &mut Io, input_change: InputChange) {
+    match input_change {
+        InputChange::MouseDown { index, value } => io.mouse_down[index] = value,
+        InputChange::KeyDown { index, value } => io.keys_down[index] = value,
+        InputChange::MouseWheelScroll { delta } => io.mouse_wheel += delta,
+        InputChange::MouseWheelHorizontalScroll { delta } => io.mouse_wheel_h += delta,
+        InputChange::AddInputCharacter { character } => io.add_input_character(character),
+        InputChange::CtrlPressed { value } => io.key_ctrl = value,
+        InputChange::ShiftPressed { value } => io.key_shift = value,
+        InputChange::AltPressed { value } => io.key_alt = value,
+        InputChange::SuperPressed { value } => io.key_super = value,
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -238,80 +282,72 @@ fn handle_input(io: &mut Io, state: u32, WPARAM(wparam): WPARAM, LPARAM(lparam):
 ////////////////////////////////////////////////////////////////////////////////
 
 #[must_use]
-pub fn imgui_wnd_proc_impl<T>(
+pub fn imgui_wnd_proc_impl(
     hwnd: HWND,
     umsg: u32,
     WPARAM(wparam): WPARAM,
     LPARAM(lparam): LPARAM,
     wnd_proc: WndProcType,
-    mut render_engine: MutexGuard<RenderEngine>,
-    imgui_render_loop: T,
-) -> LRESULT
-where
-    T: AsRef<dyn Send + Sync + ImguiRenderLoop + 'static>,
-{
-    let ctx = render_engine.ctx();
-    let mut ctx = ctx.borrow_mut();
-    let io = ctx.io_mut();
+    wnd_proc_tx: &mpsc::Sender<InputChange>,
+    should_block_messages: bool,
+) -> LRESULT {
     match umsg {
-        WM_INPUT => handle_raw_input(io, WPARAM(wparam), LPARAM(lparam)),
+        WM_INPUT => handle_raw_input(wnd_proc_tx, WPARAM(wparam), LPARAM(lparam)),
         state @ (WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP) if wparam < 256 => {
-            handle_input(io, state, WPARAM(wparam), LPARAM(lparam))
+            handle_input(wnd_proc_tx, state, WPARAM(wparam), LPARAM(lparam))
         },
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
-            io.mouse_down[0] = true;
+            _ = wnd_proc_tx.send(InputChange::MouseDown { index: 0, value: true });
         },
         WM_RBUTTONDOWN | WM_RBUTTONDBLCLK => {
-            io.mouse_down[1] = true;
+            _ = wnd_proc_tx.send(InputChange::MouseDown { index: 1, value: true });
         },
         WM_MBUTTONDOWN | WM_MBUTTONDBLCLK => {
-            io.mouse_down[2] = true;
+            _ = wnd_proc_tx.send(InputChange::MouseDown { index: 2, value: true });
         },
         WM_XBUTTONDOWN | WM_XBUTTONDBLCLK => {
             let btn = if hiword(wparam as _) == XBUTTON1 { 3 } else { 4 };
-            io.mouse_down[btn] = true;
+            _ = wnd_proc_tx.send(InputChange::MouseDown { index: btn, value: true });
         },
         WM_LBUTTONUP => {
-            io.mouse_down[0] = false;
+            _ = wnd_proc_tx.send(InputChange::MouseDown { index: 0, value: false });
         },
         WM_RBUTTONUP => {
-            io.mouse_down[1] = false;
+            _ = wnd_proc_tx.send(InputChange::MouseDown { index: 1, value: false });
         },
         WM_MBUTTONUP => {
-            io.mouse_down[2] = false;
+            _ = wnd_proc_tx.send(InputChange::MouseDown { index: 2, value: false });
         },
         WM_XBUTTONUP => {
             let btn = if hiword(wparam as _) == XBUTTON1 { 3 } else { 4 };
-            io.mouse_down[btn] = false;
+            _ = wnd_proc_tx.send(InputChange::MouseDown { index: btn, value: false });
         },
         WM_MOUSEWHEEL => {
             // This `hiword` call is equivalent to GET_WHEEL_DELTA_WPARAM
             let wheel_delta_wparam = hiword(wparam as _);
             let wheel_delta = WHEEL_DELTA as f32;
-            io.mouse_wheel += (wheel_delta_wparam as i16 as f32) / wheel_delta;
+            _ = wnd_proc_tx.send(InputChange::MouseWheelScroll {
+                delta: (wheel_delta_wparam as i16 as f32) / wheel_delta,
+            });
         },
         WM_MOUSEHWHEEL => {
             // This `hiword` call is equivalent to GET_WHEEL_DELTA_WPARAM
             let wheel_delta_wparam = hiword(wparam as _);
             let wheel_delta = WHEEL_DELTA as f32;
-            io.mouse_wheel_h += (wheel_delta_wparam as i16 as f32) / wheel_delta;
+            _ = wnd_proc_tx.send(InputChange::MouseWheelHorizontalScroll {
+                delta: (wheel_delta_wparam as i16 as f32) / wheel_delta,
+            });
         },
-        WM_CHAR => io.add_input_character(wparam as u8 as char),
+        WM_CHAR => {
+            _ = wnd_proc_tx
+                .send(InputChange::AddInputCharacter { character: wparam as u8 as char });
+        },
         WM_SIZE => {
-            drop(ctx);
-            drop(render_engine);
             RenderState::resize();
             return LRESULT(1);
         },
         _ => {},
     };
-
-    let should_block_messages = imgui_render_loop.as_ref().should_block_messages(io);
-
-    imgui_render_loop.as_ref().on_wnd_proc(hwnd, umsg, WPARAM(wparam), LPARAM(lparam));
-
-    drop(ctx);
-    drop(render_engine);
 
     if should_block_messages {
         return LRESULT(1);
